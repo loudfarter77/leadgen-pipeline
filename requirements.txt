@@ -1,0 +1,10 @@
+anthropic
+gspread
+google-auth
+google-auth-oauthlib
+google-api-python-client
+streamlit
+pandas
+fastapi
+uvicorn
+python-dotenv
