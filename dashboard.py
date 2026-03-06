@@ -1,14 +1,11 @@
 import os
-import argparse
+import json
 import anthropic
 import gspread
 from google.oauth2.service_account import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from email.mime.text import MIMEText
 import base64
-import pickle
 from dotenv import load_dotenv
 from datetime import date
 import streamlit as st
@@ -19,35 +16,21 @@ load_dotenv()
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
-sheets_creds = Credentials.from_service_account_file("service_account.json", scopes=SHEETS_SCOPES)
+service_account_info = dict(st.secrets["gcp_service_account"])
+sheets_creds = Credentials.from_service_account_info(service_account_info, scopes=SHEETS_SCOPES)
 gc = gspread.authorize(sheets_creds)
 
-gmail_creds = None
-if os.path.exists("token_gmail.pkl"):
-    with open("token_gmail.pkl", "rb") as token:
-        gmail_creds = pickle.load(token)
+gmail = None  # Gmail disabled for cloud deployment
 
-if not gmail_creds or not gmail_creds.valid:
-    if gmail_creds and gmail_creds.expired and gmail_creds.refresh_token:
-        gmail_creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file("credentials.json", GMAIL_SCOPES)
-        gmail_creds = flow.run_local_server(port=0)
-    with open("token_gmail.pkl", "wb") as token:
-        pickle.dump(gmail_creds, token)
-
-gmail = build("gmail", "v1", credentials=gmail_creds)
-claude = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+claude = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SHEET_ID = "1Y6DhYJqf4Sloa3WQxyLa5d8ER6rM582vsr_Tqc0BSO0"
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+SHEET_ID = st.secrets["SHEET_ID"]
+SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
 
-# ── Core functions (same as p6_outreach.py) ───────────────────────────────────
+# ── Email prompts ─────────────────────────────────────────────────────────────
 
 def get_prompt(lead, step):
     base = f"""You are writing a cold outreach email on behalf of an AI automation agency.
@@ -85,6 +68,8 @@ This is the final follow-up. Last attempt.
 - Let them know this is the last email
 - Leave the door open for the future
 - No hard sell"""
+
+# ── Core functions ────────────────────────────────────────────────────────────
 
 def write_email_with_claude(lead, step):
     response = claude.messages.create(
@@ -124,6 +109,9 @@ REASON: <one sentence max>"""
     return score, reason
 
 def send_email(to_email, contact_name, company_name, body, step):
+    if not gmail:
+        print("Gmail not configured — skipping send")
+        return
     subjects = {
         1: f"Quick question for {company_name}",
         2: f"Following up — {company_name}",
@@ -161,14 +149,15 @@ def update_status_only(sheet, all_records, lead, new_status):
     row_index = all_records.index(lead) + 2
     sheet.update_cell(row_index, 8, new_status)
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Outreach OS", page_icon="🤖", layout="wide")
 
 st.title("🤖 Outreach OS")
 st.caption("AI-powered lead gen & follow-up pipeline")
 
-# Load data
+# ── Load data ─────────────────────────────────────────────────────────────────
+
 sheet = gc.open_by_key(SHEET_ID).sheet1
 
 def load_data():
@@ -242,9 +231,7 @@ st.divider()
 st.subheader("All Leads")
 
 status_filter = st.selectbox("Filter by status", ["all", "new", "active", "replied", "converted", "dead"])
-
 filtered = df if status_filter == "all" else df[df["status"] == status_filter]
-
 display_cols = ["lead_id", "company_name", "contact_name", "industry", "status", "sequence_step", "last_contacted", "score", "score_reason"]
 st.dataframe(filtered[display_cols], use_container_width=True)
 
@@ -300,23 +287,22 @@ with icol5:
 
 st.divider()
 
-# ── Add new lead ──────────────────────────────────────────────────────────────
+# ── CSV Import ────────────────────────────────────────────────────────────────
 
 st.subheader("Import Leads from CSV")
 
 with st.expander("+ Upload a CSV file"):
     st.caption("CSV must have these columns: company_name, contact_name, email, industry, website, notes")
-    
     uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-    
+
     if uploaded_file:
         import_df = pd.read_csv(uploaded_file)
         st.dataframe(import_df, use_container_width=True)
-        
+
         if st.button("Import all leads"):
             required = ["company_name", "contact_name", "email", "industry", "website", "notes"]
             missing = [c for c in required if c not in import_df.columns]
-            
+
             if missing:
                 st.error(f"Missing columns: {', '.join(missing)}")
             else:
@@ -324,20 +310,11 @@ with st.expander("+ Upload a CSV file"):
                 imported = 0
                 for _, row in import_df.iterrows():
                     new_id = f"lead_{str(existing_count + imported + 1).zfill(3)}"
-                    new_row = [
-                        new_id,
-                        row["company_name"],
-                        row["contact_name"],
-                        row["email"],
-                        row.get("industry", ""),
-                        row.get("website", ""),
-                        row.get("notes", ""),
-                        "new", 0, "", "",
-                        "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "", ""
-                    ]
+                    new_row = [new_id, row["company_name"], row["contact_name"], row["email"],
+                               row.get("industry", ""), row.get("website", ""), row.get("notes", ""),
+                               "new", 0, "", "", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "", ""]
                     sheet.append_row(new_row)
                     imported += 1
-                
                 st.success(f"Imported {imported} leads!")
                 st.rerun()
 
@@ -347,7 +324,7 @@ st.divider()
 
 st.subheader("Webhook Log")
 
-webhook_leads = [r for r in all_records if "webhook" in str(r.get("notes", "")).lower() or "via webhook" in str(r.get("notes", "")).lower()]
+webhook_leads = [r for r in all_records if "webhook" in str(r.get("notes", "")).lower()]
 
 if webhook_leads:
     webhook_df = pd.DataFrame(webhook_leads)
@@ -360,6 +337,10 @@ else:
         No webhook leads yet — POST to <code>http://localhost:8000/leads</code> to see them here
     </div>
     """, unsafe_allow_html=True)
+
+st.divider()
+
+# ── Add new lead ──────────────────────────────────────────────────────────────
 
 st.subheader("Add New Lead")
 
@@ -377,7 +358,8 @@ with st.expander("+ Add a lead manually"):
 
     if st.button("Add Lead"):
         if company and contact and email:
-            new_row = [new_id, company, contact, email, industry, website, notes, "new", 0, "", "", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "", ""]
+            new_row = [new_id, company, contact, email, industry, website, notes,
+                       "new", 0, "", "", "FALSE", "FALSE", "FALSE", "FALSE", "FALSE", "", ""]
             sheet.append_row(new_row)
             st.success(f"Added {contact} from {company}!")
             st.rerun()
